@@ -1,0 +1,6 @@
+# Run before 73-seat-late.rules so uaccess grants the active local user access.
+
+# RP2040 BOOTSEL / picotool; no world-writable access.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="2e8a", ATTR{idProduct}=="0003", MODE="0660", TAG+="uaccess"
+# Runtime CDC identity does not depend on the USB manufacturer label.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="000a", ATTRS{product}=="RP2040 Glitch Tool", MODE="0660", SYMLINK+="rp2040-glitch-%s{serial}", TAG+="uaccess"

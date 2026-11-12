@@ -1,0 +1,149 @@
+; PIO0 SM3, joined TX FIFO, autopull32. DMA rings 4/8-word phase packets.
+; Injected SET PINS has optional side-set PINDIRS: latch and OE change together.
+; Startup prefetch keeps the first physical SET at cycle 6.
+.program pwm_sequence
+.origin 11
+.side_set 1 opt pindirs
+    nop [4]
+.wrap_target
+public command:
+    out exec, 32
+.wrap
+public hold:
+    out x, 32
+hold_loop:
+    jmp x--, hold_loop
+    jmp command
+
+; Fixed eight-word engine. Three-word frames: levels, directions, countdown.
+; OUT shifts right with 32-bit autopull; NOP prefetches before the first OUT.
+; OUT_COUNT bounds pad writes independently of each OUT's 32 shifted bits.
+.program waveform
+.origin 24
+.wrap_target
+public token:
+    nop
+    out pins, 32
+    out pindirs, 32
+    out x, 32
+    jmp !x, wait_sync
+hold:
+    jmp x--, hold
+.wrap
+public wait_sync:
+    wait 1 gpio 0 ; Patched to the configured internal sync GPIO.
+    jmp token
+
+; PIO1 SM0. Y=packed expected bits, OSR=wire bit count minus one.
+; Both WAIT PIN instructions are relative to SDA; IN shifts left.
+.program i2c_matcher
+.origin 0
+public idle:
+    jmp idle
+public start:
+    mov isr, null
+    mov x, osr
+bit:
+    wait 0 pin 1
+    wait 1 pin 1
+    in pins, 1
+    jmp x--, bit
+    mov x, isr
+    jmp x!=y, idle
+    set pins, 1
+    jmp idle
+
+; PIO1 SM1. X=JMP start; Y=JMP idle; JMP PIN=SCL, IN_BASE=SDA.
+; Start at sda_low: arming during a byte cannot invent a START.
+.program i2c_boundary
+.origin 11
+public sda_low:
+    wait 1 pin 0
+    jmp pin, stop
+    jmp sda_high
+stop:
+    mov isr, y
+    push block
+public sda_high:
+    wait 0 pin 0
+    jmp pin, start
+    jmp sda_low
+start:
+    mov isr, x
+    push block
+    jmp sda_low
+
+; PIO1 SM0. WAIT GPIO operands/polarities patched from SPI configuration.
+; IN_BASE=data; Y=expected wire bits; OSR=bit count minus one.
+; Four instructions per bit including both edge waits: no CPU decoding.
+.program spi_matcher
+.origin 0
+public idle:
+    wait 1 gpio 0 ; CS inactive; arming under asserted CS skips that window.
+    wait 0 gpio 0 ; CS asserted.
+    mov isr, null
+    mov x, osr
+public bit:
+    wait 0 gpio 0 ; Opposite sampling level (mode-dependent SCK).
+    wait 1 gpio 0 ; Sampling level.
+    in pins, 1
+    jmp x--, bit
+    mov x, isr
+    jmp x!=y, idle
+    set pins, 1
+    jmp idle
+
+; PIO1 SM1. X=JMP spi_matcher idle. DMA cancels only at deassertion;
+; assertion is observed directly by the comparator, avoiding DMA start jitter.
+.program spi_boundary
+.origin 12
+.wrap_target
+    wait 0 gpio 0 ; CS asserted.
+    wait 1 gpio 0 ; CS inactive.
+    mov isr, x
+    push block
+.wrap
+
+; PIO1 SM0. Require the opposite level before the selected edge, then latch.
+; No boundary detector or DMA is needed for a one-shot GPIO edge.
+.program gpio_matcher
+.origin 0
+    wait 0 gpio 0 ; Patched to opposite level on the selected input.
+    wait 1 gpio 0 ; Patched to requested edge's level.
+    set pins, 1
+done:
+    jmp done
+
+; PIO0 SM0/1 share this input-only one-shot alongside waveform/PWM.
+; Arm injects WAIT opposite before enabling; the resident WAIT sees the edge.
+; X = at_cycles - 7. WAIT recognition is t=0; PUSH executes at t=at_cycles.
+; PULL at t=at_cycles-4 samples a single readiness permit, never waits for it.
+; The X-- loop underflows: explicitly zero X for PULL NOBLOCK's empty fallback.
+; A late permit cannot escape the missed loop. DMA reads the actual RX value 1.
+.program scheduled_write
+.origin 0
+    wait 1 gpio 0 ; Patched reference level, or NOP for a deferred software origin.
+countdown:
+    jmp x--, countdown
+    set x, 0
+public cutoff:
+    pull noblock
+    mov y, osr
+    jmp !y, missed
+    mov isr, y
+public release:
+    push block
+public done:
+    jmp done
+public missed:
+    jmp missed
+
+; PIO0 slots16..17. Y=command completion_cycles-1; X remains at_cycles-7.
+; The fallthrough JMP executes on the completion cycle, replacing reference WAIT.
+; Runtime patches the JMP to absolute scheduled_write countdown at address1:
+; SDK relocation cannot encode a cross-program backward target.
+.program scheduled_origin
+.origin 16
+origin_wait:
+    jmp y--, origin_wait
+    jmp origin_wait ; Patched to absolute JMP1 during run preparation.
